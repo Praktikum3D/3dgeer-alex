@@ -50,6 +50,11 @@ __global__ void rasterize_to_pixels_from_world_3dgs_bwd_kernel(
     const int32_t *__restrict__ tile_offsets, // [B, C, tile_height, tile_width]
     const int32_t *__restrict__ flatten_ids,  // [n_isects]
     const int32_t *__restrict__ pbf_bounds,   // [B, C, N, 4], optional
+    // external rays, [B, C, image_height, image_width, 3], optional. When
+    // given they replace the rays the camera model would build per pixel, and
+    // they have to be the very same rays the forward pass was given.
+    const vec3 *__restrict__ rays_os,
+    const vec3 *__restrict__ rays_ds,
     // fwd outputs
     const scalar_t
         *__restrict__ render_alphas,      // [B, C, image_height, image_width, 1]
@@ -66,8 +71,9 @@ __global__ void rasterize_to_pixels_from_world_3dgs_bwd_kernel(
     scalar_t *__restrict__ v_colors,   // [B, C, N, CDIM] or [nnz, CDIM]
     scalar_t *__restrict__ v_opacities, // [B, C, N] or [nnz]
     vec3 *__restrict__ v_geer_gradient, // [B, C, N, 3], optional
-    vec3 *__restrict__ v_ray_os, // [B, C, image_height, image_width], optional
-    vec3 *__restrict__ v_ray_ds  // [B, C, image_height, image_width], optional
+    // [B, C, image_height, image_width, 3], optional
+    vec3 *__restrict__ v_ray_os,
+    vec3 *__restrict__ v_ray_ds
 ) {
     auto block = cg::this_thread_block();
     uint32_t iid = block.group_index().x;
@@ -107,76 +113,96 @@ __global__ void rasterize_to_pixels_from_world_3dgs_bwd_kernel(
     const int32_t pix_id =
         min(i * image_width + j, image_width * image_height - 1);
 
-    // Create rolling shutter parameter
-    auto rs_params = RollingShutterParameters(
-        viewmats0 + iid * 16,
-        viewmats1 == nullptr ? nullptr : viewmats1 + iid * 16
-    );
-    // shift pointers to the current camera. note that glm is colume-major.
-    const vec2 focal_length = {Ks[iid * 9 + 0], Ks[iid * 9 + 4]};
-    const vec2 principal_point = {Ks[iid * 9 + 2], Ks[iid * 9 + 5]};
+    const bool inside = (i < image_height && j < image_width);
+
+    vec3 ray_d = {0.f, 0.f, 0.f};
+    vec3 ray_o = {0.f, 0.f, 0.f};
+    bool ray_valid = false;
+
+    if (rays_os != nullptr) {
+        // The caller supplied the rays, so the camera model is not needed at
+        // all here. Only threads inside the image may read, `pix_id` is
+        // clamped and would alias the last pixel for the others.
+        if (inside) {
+            const uint32_t ray_id =
+                iid * image_height * image_width + i * image_width + j;
+            ray_o = rays_os[ray_id];
+            ray_d = rays_ds[ray_id];
+            ray_valid = world_ray_is_valid(ray_o, ray_d);
+        }
+    } else {
+        // Create rolling shutter parameter
+        auto rs_params = RollingShutterParameters(
+            viewmats0 + iid * 16,
+            viewmats1 == nullptr ? nullptr : viewmats1 + iid * 16
+        );
+        // shift pointers to the current camera. note that glm is colume-major.
+        const vec2 focal_length = {Ks[iid * 9 + 0], Ks[iid * 9 + 4]};
+        const vec2 principal_point = {Ks[iid * 9 + 2], Ks[iid * 9 + 5]};
     
-    // Create ray from pixel
-    WorldRay ray;
-    if (camera_model_type == CameraModelType::PINHOLE) {
-        if (radial_coeffs == nullptr && tangential_coeffs == nullptr && thin_prism_coeffs == nullptr) {
-            PerfectPinholeCameraModel::Parameters cm_params = {};
-            cm_params.resolution = {image_width, image_height};
-            cm_params.shutter_type = rs_type;
-            cm_params.principal_point = { principal_point.x, principal_point.y };
-            cm_params.focal_length = { focal_length.x, focal_length.y };
-            PerfectPinholeCameraModel camera_model(cm_params);
-            ray = camera_model.image_point_to_world_ray_shutter_pose(vec2(px, py), rs_params);
-        } else {
-            OpenCVPinholeCameraModel<>::Parameters cm_params = {};
+        // Create ray from pixel
+        WorldRay ray;
+        if (camera_model_type == CameraModelType::PINHOLE) {
+            if (radial_coeffs == nullptr && tangential_coeffs == nullptr && thin_prism_coeffs == nullptr) {
+                PerfectPinholeCameraModel::Parameters cm_params = {};
+                cm_params.resolution = {image_width, image_height};
+                cm_params.shutter_type = rs_type;
+                cm_params.principal_point = { principal_point.x, principal_point.y };
+                cm_params.focal_length = { focal_length.x, focal_length.y };
+                PerfectPinholeCameraModel camera_model(cm_params);
+                ray = camera_model.image_point_to_world_ray_shutter_pose(vec2(px, py), rs_params);
+            } else {
+                OpenCVPinholeCameraModel<>::Parameters cm_params = {};
+                cm_params.resolution = {image_width, image_height};
+                cm_params.shutter_type = rs_type;
+                cm_params.principal_point = { principal_point.x, principal_point.y };
+                cm_params.focal_length = { focal_length.x, focal_length.y };
+                if (radial_coeffs != nullptr) {
+                    cm_params.radial_coeffs = make_array<float, 6>(radial_coeffs + iid * 6);
+                }
+                if (tangential_coeffs != nullptr) {
+                    cm_params.tangential_coeffs = make_array<float, 2>(tangential_coeffs + iid * 2);
+                }
+                if (thin_prism_coeffs != nullptr) {
+                    cm_params.thin_prism_coeffs = make_array<float, 4>(thin_prism_coeffs + iid * 4);
+                }
+                OpenCVPinholeCameraModel camera_model(cm_params);
+                ray = camera_model.image_point_to_world_ray_shutter_pose(vec2(px, py), rs_params);
+            }
+        } else if (camera_model_type == CameraModelType::FISHEYE) {
+            OpenCVFisheyeCameraModel<>::Parameters cm_params = {};
             cm_params.resolution = {image_width, image_height};
             cm_params.shutter_type = rs_type;
             cm_params.principal_point = { principal_point.x, principal_point.y };
             cm_params.focal_length = { focal_length.x, focal_length.y };
             if (radial_coeffs != nullptr) {
-                cm_params.radial_coeffs = make_array<float, 6>(radial_coeffs + iid * 6);
+                cm_params.radial_coeffs = make_array<float, 4>(radial_coeffs + iid * 4);
             }
-            if (tangential_coeffs != nullptr) {
-                cm_params.tangential_coeffs = make_array<float, 2>(tangential_coeffs + iid * 2);
-            }
-            if (thin_prism_coeffs != nullptr) {
-                cm_params.thin_prism_coeffs = make_array<float, 4>(thin_prism_coeffs + iid * 4);
-            }
-            OpenCVPinholeCameraModel camera_model(cm_params);
+            assert(fisheye_max_angles != nullptr);
+            OpenCVFisheyeCameraModel camera_model(
+                cm_params, 1e-6f, fisheye_max_angles[iid]
+            );
             ray = camera_model.image_point_to_world_ray_shutter_pose(vec2(px, py), rs_params);
+        } else if (camera_model_type == CameraModelType::FTHETA) {
+            FThetaCameraModel<>::Parameters cm_params = {};
+            cm_params.resolution = {image_width, image_height};
+            cm_params.shutter_type = rs_type;
+            cm_params.principal_point = { principal_point.x, principal_point.y };
+            cm_params.dist = ftheta_coeffs;
+            FThetaCameraModel camera_model(cm_params);
+            ray = camera_model.image_point_to_world_ray_shutter_pose(vec2(px, py), rs_params);
+        } else {
+            // should never reach here
+            assert(false);
+            ray = {vec3(0.f), vec3(0.f), false};
         }
-    } else if (camera_model_type == CameraModelType::FISHEYE) {
-        OpenCVFisheyeCameraModel<>::Parameters cm_params = {};
-        cm_params.resolution = {image_width, image_height};
-        cm_params.shutter_type = rs_type;
-        cm_params.principal_point = { principal_point.x, principal_point.y };
-        cm_params.focal_length = { focal_length.x, focal_length.y };
-        if (radial_coeffs != nullptr) {
-            cm_params.radial_coeffs = make_array<float, 4>(radial_coeffs + iid * 4);
-        }
-        assert(fisheye_max_angles != nullptr);
-        OpenCVFisheyeCameraModel camera_model(
-            cm_params, 1e-6f, fisheye_max_angles[iid]
-        );
-        ray = camera_model.image_point_to_world_ray_shutter_pose(vec2(px, py), rs_params);
-    } else if (camera_model_type == CameraModelType::FTHETA) {
-        FThetaCameraModel<>::Parameters cm_params = {};
-        cm_params.resolution = {image_width, image_height};
-        cm_params.shutter_type = rs_type;
-        cm_params.principal_point = { principal_point.x, principal_point.y };
-        cm_params.dist = ftheta_coeffs;
-        FThetaCameraModel camera_model(cm_params);
-        ray = camera_model.image_point_to_world_ray_shutter_pose(vec2(px, py), rs_params);
-    } else {
-        // should never reach here
-        assert(false);
-        return;
+        ray_d = ray.ray_dir;
+        ray_o = ray.ray_org;
+        ray_valid = ray.valid_flag;
     }
-    const vec3 ray_d = ray.ray_dir;
-    const vec3 ray_o = ray.ray_org;
 
     // keep not rasterizing threads around for reading data
-    bool done = (i < image_height && j < image_width) && ray.valid_flag;
+    bool done = inside && ray_valid;
 
     // have all threads in tile process the same gaussians in batches
     // first collect gaussians between range.x and range.y in batches
@@ -449,7 +475,7 @@ __global__ void rasterize_to_pixels_from_world_3dgs_bwd_kernel(
 
     // one thread owns one pixel, so a plain store is enough. note that `pix_id`
     // is clamped to the last pixel, so out of bounds threads must never write.
-    if (compute_ray_grads && i < image_height && j < image_width) {
+    if (compute_ray_grads && inside) {
         const uint32_t out_id = i * image_width + j;
         v_ray_os[out_id] = v_ray_o_pix;
         v_ray_ds[out_id] = v_ray_d_pix;
@@ -487,6 +513,9 @@ void launch_rasterize_to_pixels_from_world_3dgs_bwd_kernel(
     const at::Tensor tile_offsets,    // [..., C, tile_height, tile_width]
     const at::Tensor flatten_ids,     // [n_isects]
     const at::optional<at::Tensor> pbf_bounds, // [..., C, N, 4], optional
+    // external rays
+    const at::optional<at::Tensor> rays_os, // [..., C, H, W, 3], optional
+    const at::optional<at::Tensor> rays_ds, // [..., C, H, W, 3], optional
     // forward outputs
     const at::Tensor render_alphas,   // [..., C, image_height, image_width, 1]
     const at::Tensor last_ids,        // [..., C, image_height, image_width]
@@ -590,6 +619,13 @@ void launch_rasterize_to_pixels_from_world_3dgs_bwd_kernel(
             pbf_bounds.has_value()
                 ? pbf_bounds.value().data_ptr<int32_t>()
                 : nullptr,
+            // external rays
+            rays_os.has_value()
+                ? reinterpret_cast<vec3 *>(rays_os.value().data_ptr<float>())
+                : nullptr,
+            rays_ds.has_value()
+                ? reinterpret_cast<vec3 *>(rays_ds.value().data_ptr<float>())
+                : nullptr,
             render_alphas.data_ptr<float>(),
             last_ids.data_ptr<int32_t>(),
             v_render_colors.data_ptr<float>(),
@@ -643,6 +679,8 @@ void launch_rasterize_to_pixels_from_world_3dgs_bwd_kernel(
         const at::Tensor tile_offsets,                                         \
         const at::Tensor flatten_ids,                                          \
         const at::optional<at::Tensor> pbf_bounds,                            \
+        const at::optional<at::Tensor> rays_os,                               \
+        const at::optional<at::Tensor> rays_ds,                               \
         const at::Tensor render_alphas,                                        \
         const at::Tensor last_ids,                                             \
         const at::Tensor v_render_colors,                                      \

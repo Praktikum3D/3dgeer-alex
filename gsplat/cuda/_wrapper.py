@@ -806,11 +806,14 @@ def rasterize_to_pixels_eval3d(
     3D world space instead of the 2D image space. Supports rolling shutter and
     camera distortion.
 
-    The optional `rays_o` and `rays_d` are the per pixel world space rays. They
-    are not used by the forward pass, which still generates its rays from the
-    camera model. They only carry the per pixel ray gradients out of the
-    backward pass, so that a camera model written in PyTorch can be trained
-    through them.
+    The optional `rays_o` and `rays_d` are the per pixel world space rays. When
+    they are given they replace the rays that the forward and the backward pass
+    would otherwise build from the camera model, and they receive the per pixel
+    ray gradients, so that a camera model written in PyTorch can be trained
+    through them. `Ks`, `camera_model` and the distortion coefficients are then
+    only used for the tile assignment that happens outside of this function.
+    Pass unit length directions, since the gradients are reported with respect
+    to the vectors as given.
 
     Returns:
         A tuple:
@@ -876,12 +879,24 @@ def rasterize_to_pixels_eval3d(
         assert geer_gradient.shape == batch_dims + (C, N, 3), geer_gradient.shape
 
     ray_shape = batch_dims + (C, image_height, image_width, 3)
-    assert (rays_o is None) == (
-        rays_d is None
-    ), "rays_o and rays_d must be given together"
+    if (rays_o is None) != (rays_d is None):
+        raise ValueError("rays_o and rays_d must be given together")
     if rays_o is not None:
-        assert rays_o.shape == ray_shape, rays_o.shape
-        assert rays_d.shape == ray_shape, rays_d.shape
+        for name, rays in (("rays_o", rays_o), ("rays_d", rays_d)):
+            if rays.shape != ray_shape:
+                raise ValueError(
+                    f"{name} must have shape {tuple(ray_shape)}, got "
+                    f"{tuple(rays.shape)}"
+                )
+            if rays.dtype != torch.float32:
+                raise ValueError(f"{name} must be float32, got {rays.dtype}")
+            if rays.device != device:
+                raise ValueError(
+                    f"{name} must live on the same device as the means "
+                    f"({device}), got {rays.device}"
+                )
+        rays_o = rays_o.contiguous()
+        rays_d = rays_d.contiguous()
 
     # Pad the channels to the nearest supported number if necessary
     channels = colors.shape[-1]
@@ -1605,8 +1620,8 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
         viewmats_rs: Optional[Tensor] = None,  # [..., C, 4, 4]
         pbf_bounds: Optional[Tensor] = None,  # [..., C, N, 4], GEER only
         geer_gradient: Optional[Tensor] = None,  # [..., C, N, 3], autograd-only
-        rays_o: Optional[Tensor] = None,  # [..., C, H, W, 3], gradient sink
-        rays_d: Optional[Tensor] = None,  # [..., C, H, W, 3], gradient sink
+        rays_o: Optional[Tensor] = None,  # [..., C, H, W, 3], external rays
+        rays_d: Optional[Tensor] = None,  # [..., C, H, W, 3], external rays
     ) -> Tuple[Tensor, Tensor]:
         ut_params = ut_params.to_cpp()
         rs_type = rolling_shutter.to_cpp()
@@ -1645,6 +1660,8 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
             isect_offsets,
             flatten_ids,
             pbf_bounds,
+            rays_o,
+            rays_d,
         )
 
         ctx.save_for_backward(
@@ -1665,6 +1682,8 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
             flatten_ids,
             pbf_bounds,
             geer_gradient,
+            rays_o,
+            rays_d,
             render_alphas,
             last_ids,
         )
@@ -1675,9 +1694,8 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
         ctx.camera_model_type = camera_model_type
         ctx.tile_size = tile_size
         ctx.ftheta_coeffs = ftheta_coeffs
-        # The rays are not used by the forward math yet. They only exist so that
-        # the backward pass has autograd slots to return the per pixel ray
-        # gradients in.
+        # The per pixel ray gradients cost an extra store per pixel, so only
+        # compute them when something downstream of the rays wants them.
         ctx.compute_ray_grads = (
             rays_o is not None
             and rays_d is not None
@@ -1710,6 +1728,8 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
             flatten_ids,
             pbf_bounds,
             geer_gradient,
+            rays_o,
+            rays_d,
             render_alphas,
             last_ids,
         ) = ctx.saved_tensors
@@ -1756,6 +1776,8 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
             isect_offsets,
             flatten_ids,
             pbf_bounds,
+            rays_o,
+            rays_d,
             render_alphas,
             last_ids,
             v_render_colors.contiguous(),
