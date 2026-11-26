@@ -276,7 +276,9 @@ void launch_rasterize_to_pixels_from_world_3dgs_bwd_kernel(
     at::Tensor v_scales,     // [..., N, 3]
     at::Tensor v_colors,     // [..., C, N, 3] or [nnz, 3]
     at::Tensor v_opacities,  // [..., C, N] or [nnz]
-    const at::optional<at::Tensor> v_geer_gradient // [..., C, N, 3], optional
+    const at::optional<at::Tensor> v_geer_gradient, // [..., C, N, 3], optional
+    const at::optional<at::Tensor> v_ray_os, // [..., C, H, W, 3], optional
+    const at::optional<at::Tensor> v_ray_ds  // [..., C, H, W, 3], optional
 ) ;
 
 } // namespace gsplat

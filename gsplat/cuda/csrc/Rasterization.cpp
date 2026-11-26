@@ -831,7 +831,14 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_from_world_3d
 };
 
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+std::tuple<
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor>
 rasterize_to_pixels_from_world_3dgs_bwd(
     // Gaussian parameters
     const at::Tensor means,  // [..., N, 3]
@@ -867,7 +874,8 @@ rasterize_to_pixels_from_world_3dgs_bwd(
     // gradients of outputs
     const at::Tensor v_render_colors, // [..., C, image_height, image_width, 3]
     const at::Tensor v_render_alphas, // [..., C, image_height, image_width, 1]
-    const at::optional<at::Tensor> v_geer_gradient // [..., C, N, 3], optional output
+    const at::optional<at::Tensor> v_geer_gradient, // [..., C, N, 3], optional output
+    const bool compute_ray_grads // allocate and fill the per pixel ray gradients
 ) {
     DEVICE_GUARD(means);
     CHECK_INPUT(means);
@@ -901,6 +909,16 @@ rasterize_to_pixels_from_world_3dgs_bwd(
     at::Tensor v_scales = at::zeros_like(scales);
     at::Tensor v_colors = at::zeros_like(colors);
     at::Tensor v_opacities = at::zeros_like(opacities);
+
+    // per pixel world space ray gradients, [..., C, image_height, image_width, 3]
+    at::optional<at::Tensor> v_ray_os;
+    at::optional<at::Tensor> v_ray_ds;
+    if (compute_ray_grads) {
+        auto ray_shape = v_render_alphas.sizes().vec();
+        ray_shape.back() = 3;
+        v_ray_os = at::zeros(ray_shape, means.options());
+        v_ray_ds = at::zeros(ray_shape, means.options());
+    }
 
     at::Tensor fisheye_max_angles;
     if (camera_model == CameraModelType::FISHEYE) {
@@ -945,7 +963,9 @@ rasterize_to_pixels_from_world_3dgs_bwd(
             v_scales,                                                          \
             v_colors,                                                          \
             v_opacities,                                                       \
-            v_geer_gradient                                                    \
+            v_geer_gradient,                                                   \
+            v_ray_os,                                                          \
+            v_ray_ds                                                           \
         );                                                                     \
         break;
 
@@ -977,8 +997,15 @@ rasterize_to_pixels_from_world_3dgs_bwd(
     }
 #undef __LAUNCH_KERNEL__
 
+    // undefined tensors are returned as None on the python side
     return std::make_tuple(
-        v_means, v_quats, v_scales, v_colors, v_opacities
+        v_means,
+        v_quats,
+        v_scales,
+        v_colors,
+        v_opacities,
+        v_ray_os.has_value() ? v_ray_os.value() : at::Tensor(),
+        v_ray_ds.has_value() ? v_ray_ds.value() : at::Tensor()
     );
 }
 

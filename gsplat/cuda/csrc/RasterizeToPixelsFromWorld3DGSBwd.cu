@@ -65,7 +65,9 @@ __global__ void rasterize_to_pixels_from_world_3dgs_bwd_kernel(
     vec3 *__restrict__ v_scales,       // [B, N, 3]
     scalar_t *__restrict__ v_colors,   // [B, C, N, CDIM] or [nnz, CDIM]
     scalar_t *__restrict__ v_opacities, // [B, C, N] or [nnz]
-    vec3 *__restrict__ v_geer_gradient  // [B, C, N, 3], optional
+    vec3 *__restrict__ v_geer_gradient, // [B, C, N, 3], optional
+    vec3 *__restrict__ v_ray_os, // [B, C, image_height, image_width], optional
+    vec3 *__restrict__ v_ray_ds  // [B, C, image_height, image_width], optional
 ) {
     auto block = cg::this_thread_block();
     uint32_t iid = block.group_index().x;
@@ -84,6 +86,13 @@ __global__ void rasterize_to_pixels_from_world_3dgs_bwd_kernel(
     }
     if (masks != nullptr) {
         masks += iid * tile_height * tile_width;
+    }
+    // per pixel ray gradients are optional, skip all of their work when the
+    // caller did not ask for them
+    const bool compute_ray_grads = (v_ray_os != nullptr);
+    if (compute_ray_grads) {
+        v_ray_os += iid * image_height * image_width;
+        v_ray_ds += iid * image_height * image_width;
     }
 
     // when the mask is provided, do nothing and return if
@@ -214,6 +223,12 @@ __global__ void rasterize_to_pixels_from_world_3dgs_bwd_kernel(
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
     const int32_t warp_bin_final =
         cg::reduce(warp, bin_final, cg::greater<int>());
+
+    // per pixel (per thread) accumulators for the world space ray gradients.
+    // they are private to this thread, so no warp reduction and no atomics.
+    vec3 v_ray_o_pix = {0.f, 0.f, 0.f};
+    vec3 v_ray_d_pix = {0.f, 0.f, 0.f};
+
     for (uint32_t b = 0; b < num_batches; ++b) {
         // resync all threads before writing next batch of shared mem
         block.sync();
@@ -367,6 +382,12 @@ __global__ void rasterize_to_pixels_from_world_3dgs_bwd_kernel(
                             (glm::transpose(Mt) * v_gro_abs) * proxy_scale;
                     }
 
+                    if (compute_ray_grads) {
+                        // gro = Mt * (ray_o - mean), grd = Mt * ray_d
+                        v_ray_o_pix += v_o_minus_mu;
+                        v_ray_d_pix += glm::transpose(Mt) * v_grd;
+                    }
+
                     v_mean_local += -v_o_minus_mu;
                     quat_scale_to_preci_half_vjp(
                         quat, scale, R, glm::transpose(v_Mt), v_quat_local, v_scale_local
@@ -425,6 +446,14 @@ __global__ void rasterize_to_pixels_from_world_3dgs_bwd_kernel(
             }
         }
     }
+
+    // one thread owns one pixel, so a plain store is enough. note that `pix_id`
+    // is clamped to the last pixel, so out of bounds threads must never write.
+    if (compute_ray_grads && i < image_height && j < image_width) {
+        const uint32_t out_id = i * image_width + j;
+        v_ray_os[out_id] = v_ray_o_pix;
+        v_ray_ds[out_id] = v_ray_d_pix;
+    }
 }
 
 template <uint32_t CDIM>
@@ -470,7 +499,9 @@ void launch_rasterize_to_pixels_from_world_3dgs_bwd_kernel(
     at::Tensor v_scales,     // [..., N, 3]
     at::Tensor v_colors,     // [..., C, N, 3] or [nnz, 3]
     at::Tensor v_opacities,  // [..., C, N] or [nnz]
-    const at::optional<at::Tensor> v_geer_gradient // [..., C, N, 3], optional
+    const at::optional<at::Tensor> v_geer_gradient, // [..., C, N, 3], optional
+    const at::optional<at::Tensor> v_ray_os, // [..., C, H, W, 3], optional
+    const at::optional<at::Tensor> v_ray_ds  // [..., C, H, W, 3], optional
 ) {
     bool packed = opacities.dim() == 1;
     assert (packed == false); // only support non-packed for now
@@ -573,6 +604,12 @@ void launch_rasterize_to_pixels_from_world_3dgs_bwd_kernel(
                 ? reinterpret_cast<vec3 *>(
                       v_geer_gradient.value().data_ptr<float>()
                   )
+                : nullptr,
+            v_ray_os.has_value()
+                ? reinterpret_cast<vec3 *>(v_ray_os.value().data_ptr<float>())
+                : nullptr,
+            v_ray_ds.has_value()
+                ? reinterpret_cast<vec3 *>(v_ray_ds.value().data_ptr<float>())
                 : nullptr
         );
 }
@@ -615,7 +652,9 @@ void launch_rasterize_to_pixels_from_world_3dgs_bwd_kernel(
         at::Tensor v_scales,                                                   \
         at::Tensor v_colors,                                                   \
         at::Tensor v_opacities,                                                \
-        const at::optional<at::Tensor> v_geer_gradient                        \
+        const at::optional<at::Tensor> v_geer_gradient,                       \
+        const at::optional<at::Tensor> v_ray_os,                              \
+        const at::optional<at::Tensor> v_ray_ds                               \
     );
 
 __INS__(1)
