@@ -58,6 +58,12 @@ Notes from upstream that still apply:
 
 These are consistent with `gsplat`'s 3DGUT implementation (`with_ut`).
 
+One deviation from upstream: the auxiliary densification tensor `meta["geer_gradient"]` of the
+3DGEER paper is only allocated when `rasterization(..., with_geer_gradient=True)` is passed, and is
+`None` otherwise. Upstream allocated it whenever autograd was enabled, which costs one `[..., C, N, 3]` tensor plus three
+atomic adds per Gaussian and pixel in the backward pass even though only `DefaultStrategy` ever
+reads it. Pass the flag when densifying with that metric.
+
 ## Tests
 
 The tests need a CUDA GPU.
