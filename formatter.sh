@@ -5,4 +5,4 @@ find gsplat/cuda/include \
   -exec clang-format -i {} \;
 
 # install via: pip install black==22.3.0
-black . gsplat/ tests/ examples/ profiling/
+black . gsplat/ tests/

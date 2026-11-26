@@ -8,8 +8,6 @@ import torch
 from torch import Tensor
 from typing_extensions import Literal
 
-import matplotlib.pyplot as plt
-
 
 def _make_lazy_cuda_func(name: str) -> Callable:
     def call_cuda(*args, **kwargs):
