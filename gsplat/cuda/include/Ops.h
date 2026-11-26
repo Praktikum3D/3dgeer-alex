@@ -575,7 +575,14 @@ rasterize_to_pixels_from_world_3dgs_fwd(
     const at::optional<at::Tensor> pbf_bounds // [..., C, N, 4], optional
 );
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+std::tuple<
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor>
 rasterize_to_pixels_from_world_3dgs_bwd(
     // Gaussian parameters
     const at::Tensor means,                     // [..., N, 3]
@@ -612,7 +619,8 @@ rasterize_to_pixels_from_world_3dgs_bwd(
     // gradients of outputs
     const at::Tensor v_render_colors, // [..., C, image_height, image_width, 3]
     const at::Tensor v_render_alphas, // [..., C, image_height, image_width, 1]
-    const at::optional<at::Tensor> v_geer_gradient // [..., C, N, 3], optional output
+    const at::optional<at::Tensor> v_geer_gradient, // [..., C, N, 3], optional output
+    const bool compute_ray_grads // allocate and fill the per pixel ray gradients
 );
 
 } // namespace gsplat

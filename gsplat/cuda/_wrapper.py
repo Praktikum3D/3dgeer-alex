@@ -797,12 +797,20 @@ def rasterize_to_pixels_eval3d(
     viewmats_rs: Optional[Tensor] = None,  # [..., C, 4, 4]
     pbf_bounds: Optional[Tensor] = None,  # [..., C, N, 4], GEER only
     geer_gradient: Optional[Tensor] = None,  # [..., C, N, 3], autograd-only
+    rays_o: Optional[Tensor] = None,  # [..., C, H, W, 3], autograd-only
+    rays_d: Optional[Tensor] = None,  # [..., C, H, W, 3], autograd-only
 ) -> Tuple[Tensor, Tensor]:
     """Rasterizes Gaussians to pixels.
 
     Similar to `rasterize_to_pixels()`, but compute the Gaussian responses in the
     3D world space instead of the 2D image space. Supports rolling shutter and
     camera distortion.
+
+    The optional `rays_o` and `rays_d` are the per pixel world space rays. They
+    are not used by the forward pass, which still generates its rays from the
+    camera model. They only carry the per pixel ray gradients out of the
+    backward pass, so that a camera model written in PyTorch can be trained
+    through them.
 
     Returns:
         A tuple:
@@ -866,6 +874,14 @@ def rasterize_to_pixels_eval3d(
 
     if geer_gradient is not None:
         assert geer_gradient.shape == batch_dims + (C, N, 3), geer_gradient.shape
+
+    ray_shape = batch_dims + (C, image_height, image_width, 3)
+    assert (rays_o is None) == (
+        rays_d is None
+    ), "rays_o and rays_d must be given together"
+    if rays_o is not None:
+        assert rays_o.shape == ray_shape, rays_o.shape
+        assert rays_d.shape == ray_shape, rays_d.shape
 
     # Pad the channels to the nearest supported number if necessary
     channels = colors.shape[-1]
@@ -949,6 +965,8 @@ def rasterize_to_pixels_eval3d(
         viewmats_rs.contiguous() if viewmats_rs is not None else None,
         pbf_bounds,
         geer_gradient,
+        rays_o,
+        rays_d,
     )
 
     if padded_channels > 0:
@@ -1587,6 +1605,8 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
         viewmats_rs: Optional[Tensor] = None,  # [..., C, 4, 4]
         pbf_bounds: Optional[Tensor] = None,  # [..., C, N, 4], GEER only
         geer_gradient: Optional[Tensor] = None,  # [..., C, N, 3], autograd-only
+        rays_o: Optional[Tensor] = None,  # [..., C, H, W, 3], gradient sink
+        rays_d: Optional[Tensor] = None,  # [..., C, H, W, 3], gradient sink
     ) -> Tuple[Tensor, Tensor]:
         ut_params = ut_params.to_cpp()
         rs_type = rolling_shutter.to_cpp()
@@ -1655,6 +1675,14 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
         ctx.camera_model_type = camera_model_type
         ctx.tile_size = tile_size
         ctx.ftheta_coeffs = ftheta_coeffs
+        # The rays are not used by the forward math yet. They only exist so that
+        # the backward pass has autograd slots to return the per pixel ray
+        # gradients in.
+        ctx.compute_ray_grads = (
+            rays_o is not None
+            and rays_d is not None
+            and (rays_o.requires_grad or rays_d.requires_grad)
+        )
 
         return render_colors, render_alphas
 
@@ -1696,9 +1724,15 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
             torch.zeros_like(geer_gradient) if geer_gradient is not None else None
         )
 
-        (v_means, v_quats, v_scales, v_colors, v_opacities,) = _make_lazy_cuda_func(
-            "rasterize_to_pixels_from_world_3dgs_bwd"
-        )(
+        (
+            v_means,
+            v_quats,
+            v_scales,
+            v_colors,
+            v_opacities,
+            v_rays_o,
+            v_rays_d,
+        ) = _make_lazy_cuda_func("rasterize_to_pixels_from_world_3dgs_bwd")(
             means,
             quats,
             scales,
@@ -1727,6 +1761,7 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
             v_render_colors.contiguous(),
             v_render_alphas.contiguous(),
             v_geer_gradient,
+            ctx.compute_ray_grads,
         )
 
         if ctx.needs_input_grad[5]:  # backgrounds
@@ -1764,6 +1799,8 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
             None,  # viewmats_rs
             None,  # pbf_bounds
             v_geer_gradient,
+            v_rays_o,
+            v_rays_d,
         )
 
 
