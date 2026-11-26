@@ -293,75 +293,6 @@ __forceinline__ __device__ float2 invinterpolated_uv(
 	return uv_indices;
 }
 
-__forceinline__ __device__ void invinterpolated_aabb(
-	const int W, int H,
-	const float focal_x, float focal_y,
-	const float principal_x, float principal_y,
-	const float4 dist_coeff,
-	const float4 tan_xxyy,
-    int* u_indices, int* v_indices) {
-	if ((tan_xxyy.y < 0.0f && tan_xxyy.z > 0.0f) || (tan_xxyy.x > 0.0f && tan_xxyy.w < 0.0f)) {
-		float2 _left_bottom = invinterpolated_uv(focal_x, focal_y, principal_x, principal_y, dist_coeff, tan_xxyy.x, tan_xxyy.z);
-		float2 _right_top = invinterpolated_uv(focal_x, focal_y, principal_x, principal_y, dist_coeff, tan_xxyy.y, tan_xxyy.w);
-		u_indices[0] = (int)floor(_left_bottom.x);
-		u_indices[1] = (int)floor(_right_top.x);
-		v_indices[0] = (int)floor(_left_bottom.y);
-		v_indices[1] = (int)floor(_right_top.y);
-	} else if ((tan_xxyy.y < 0.0f && tan_xxyy.w < 0.0f) || (tan_xxyy.x > 0.0f && tan_xxyy.z > 0.0f)) {
-		float2 _left_top = invinterpolated_uv(focal_x, focal_y, principal_x, principal_y, dist_coeff, tan_xxyy.x, tan_xxyy.w);
-		float2 _right_bottom = invinterpolated_uv(focal_x, focal_y, principal_x, principal_y, dist_coeff, tan_xxyy.y, tan_xxyy.z);
-		u_indices[0] = (int)floor(_left_top.x);
-		u_indices[1] = (int)floor(_right_bottom.x);
-		v_indices[0] = (int)floor(_right_bottom.y);
-		v_indices[1] = (int)floor(_left_top.y);
-	} else if ((tan_xxyy.x < 0.0f && tan_xxyy.y > 0.0f) && tan_xxyy.z > 0.0f) {
-		float2 _left_bottom = invinterpolated_uv(focal_x, focal_y, principal_x, principal_y, dist_coeff, tan_xxyy.x, tan_xxyy.z);
-		float2 _right_bottom = invinterpolated_uv(focal_x, focal_y, principal_x, principal_y, dist_coeff, tan_xxyy.y, tan_xxyy.z);
-		float2 _mid_top = invinterpolated_uv(focal_x, focal_y, principal_x, principal_y, dist_coeff, 0.0f, tan_xxyy.w);
-		u_indices[0] = (int)floor(_left_bottom.x);
-		u_indices[1] = (int)floor(_right_bottom.x);
-		v_indices[0] = (int)floor(fminf(_left_bottom.y, _right_bottom.y));
-		v_indices[1] = (int)floor(_mid_top.y);
-	} else if ((tan_xxyy.x < 0.0f && tan_xxyy.y > 0.0f) && tan_xxyy.w < 0.0f) {
-		float2 _right_top = invinterpolated_uv(focal_x, focal_y, principal_x, principal_y, dist_coeff, tan_xxyy.y, tan_xxyy.w);
-		float2 _left_top = invinterpolated_uv(focal_x, focal_y, principal_x, principal_y, dist_coeff, tan_xxyy.x, tan_xxyy.w);
-		float2 _mid_bottom = invinterpolated_uv(focal_x, focal_y, principal_x, principal_y, dist_coeff, 0.0f, tan_xxyy.z);
-		u_indices[0] = (int)floor(_left_top.x);
-		u_indices[1] = (int)floor(_right_top.x);
-		v_indices[0] = (int)floor(_mid_bottom.y);
-		v_indices[1] = (int)floor(fmaxf(_left_top.y, _right_top.y));
-	} else if ((tan_xxyy.z < 0.0f && tan_xxyy.w > 0.0f) && tan_xxyy.y < 0.0f) {
-		float2 _right_top = invinterpolated_uv(focal_x, focal_y, principal_x, principal_y, dist_coeff, tan_xxyy.y, tan_xxyy.w);
-		float2 _right_bottom = invinterpolated_uv(focal_x, focal_y, principal_x, principal_y, dist_coeff, tan_xxyy.y, tan_xxyy.z);
-		float2 _left_mid = invinterpolated_uv(focal_x, focal_y, principal_x, principal_y, dist_coeff, tan_xxyy.x, 0.0f);
-		u_indices[0] = (int)floor(_left_mid.x);
-		u_indices[1] = (int)floor(fmaxf(_right_bottom.x, _right_top.x));
-		v_indices[0] = (int)floor(_right_bottom.y);
-		v_indices[1] = (int)floor(_right_top.y);
-	} else if ((tan_xxyy.z < 0.0f && tan_xxyy.w > 0.0f) && tan_xxyy.x > 0.0f) {
-		float2 _left_bottom = invinterpolated_uv(focal_x, focal_y, principal_x, principal_y, dist_coeff, tan_xxyy.x, tan_xxyy.z);
-		float2 _left_top = invinterpolated_uv(focal_x, focal_y, principal_x, principal_y, dist_coeff, tan_xxyy.x, tan_xxyy.w);
-		float2 _right_mid = invinterpolated_uv(focal_x, focal_y, principal_x, principal_y, dist_coeff, tan_xxyy.y, 0.0f);
-		u_indices[0] = (int)floor(fminf(_left_bottom.x, _left_top.x));
-		u_indices[1] = (int)floor(_right_mid.x);
-		v_indices[0] = (int)floor(_left_bottom.y);
-		v_indices[1] = (int)floor(_left_top.y);
-	} else {
-		float2 _mid_top = invinterpolated_uv(focal_x, focal_y, principal_x, principal_y, dist_coeff, 0.0f, tan_xxyy.w);
-		float2 _mid_bottom = invinterpolated_uv(focal_x, focal_y, principal_x, principal_y, dist_coeff, 0.0f, tan_xxyy.z);
-		float2 _left_mid = invinterpolated_uv(focal_x, focal_y, principal_x, principal_y, dist_coeff, tan_xxyy.x, 0.0f);
-		float2 _right_mid = invinterpolated_uv(focal_x, focal_y, principal_x, principal_y, dist_coeff, tan_xxyy.y, 0.0f);
-		u_indices[0] = (int)floor(_left_mid.x);
-		u_indices[1] = (int)floor(_right_mid.x);
-		v_indices[0] = (int)floor(_mid_bottom.y);
-		v_indices[1] = (int)floor(_mid_top.y);
-	}
-	u_indices[0] = fminf(fmaxf((int)0, u_indices[0]), (int)(W-1));
-	u_indices[1] = fminf(fmaxf((int)0, u_indices[1]), (int)(W-1));
-	v_indices[0] = fminf(fmaxf((int)0, v_indices[0]), (int)(H-1));
-	v_indices[1] = fminf(fmaxf((int)0, v_indices[1]), (int)(H-1));
-}
-
 // Conservative interval arithmetic for mapping a tangent-space PBF through a
 // nonlinear camera model.  Tile association must over-estimate the projected
 // footprint: an under-estimate drops a Gaussian before exact ray evaluation.
@@ -464,6 +395,62 @@ __forceinline__ __device__ bool geer_store_pixel_aabb(
     v_indices[0] = lower_index(v.lo, H);
     v_indices[1] = upper_index(v.hi, H);
     return u_indices[0] < u_indices[1] && v_indices[0] < v_indices[1];
+}
+
+__forceinline__ __device__ bool invinterpolated_aabb(
+	const int W, int H,
+	const float focal_x, float focal_y,
+	const float principal_x, float principal_y,
+	const float4 dist_coeff,
+	const float4 tan_xxyy,
+    int* u_indices, int* v_indices) {
+	GEERInterval u, v;
+	if ((tan_xxyy.y < 0.0f && tan_xxyy.z > 0.0f) || (tan_xxyy.x > 0.0f && tan_xxyy.w < 0.0f)) {
+		float2 _left_bottom = invinterpolated_uv(focal_x, focal_y, principal_x, principal_y, dist_coeff, tan_xxyy.x, tan_xxyy.z);
+		float2 _right_top = invinterpolated_uv(focal_x, focal_y, principal_x, principal_y, dist_coeff, tan_xxyy.y, tan_xxyy.w);
+		u = geer_interval(_left_bottom.x, _right_top.x);
+		v = geer_interval(_left_bottom.y, _right_top.y);
+	} else if ((tan_xxyy.y < 0.0f && tan_xxyy.w < 0.0f) || (tan_xxyy.x > 0.0f && tan_xxyy.z > 0.0f)) {
+		float2 _left_top = invinterpolated_uv(focal_x, focal_y, principal_x, principal_y, dist_coeff, tan_xxyy.x, tan_xxyy.w);
+		float2 _right_bottom = invinterpolated_uv(focal_x, focal_y, principal_x, principal_y, dist_coeff, tan_xxyy.y, tan_xxyy.z);
+		u = geer_interval(_left_top.x, _right_bottom.x);
+		v = geer_interval(_right_bottom.y, _left_top.y);
+	} else if ((tan_xxyy.x < 0.0f && tan_xxyy.y > 0.0f) && tan_xxyy.z > 0.0f) {
+		float2 _left_bottom = invinterpolated_uv(focal_x, focal_y, principal_x, principal_y, dist_coeff, tan_xxyy.x, tan_xxyy.z);
+		float2 _right_bottom = invinterpolated_uv(focal_x, focal_y, principal_x, principal_y, dist_coeff, tan_xxyy.y, tan_xxyy.z);
+		float2 _mid_top = invinterpolated_uv(focal_x, focal_y, principal_x, principal_y, dist_coeff, 0.0f, tan_xxyy.w);
+		u = geer_interval(_left_bottom.x, _right_bottom.x);
+		v = geer_interval(fminf(_left_bottom.y, _right_bottom.y), _mid_top.y);
+	} else if ((tan_xxyy.x < 0.0f && tan_xxyy.y > 0.0f) && tan_xxyy.w < 0.0f) {
+		float2 _right_top = invinterpolated_uv(focal_x, focal_y, principal_x, principal_y, dist_coeff, tan_xxyy.y, tan_xxyy.w);
+		float2 _left_top = invinterpolated_uv(focal_x, focal_y, principal_x, principal_y, dist_coeff, tan_xxyy.x, tan_xxyy.w);
+		float2 _mid_bottom = invinterpolated_uv(focal_x, focal_y, principal_x, principal_y, dist_coeff, 0.0f, tan_xxyy.z);
+		u = geer_interval(_left_top.x, _right_top.x);
+		v = geer_interval(_mid_bottom.y, fmaxf(_left_top.y, _right_top.y));
+	} else if ((tan_xxyy.z < 0.0f && tan_xxyy.w > 0.0f) && tan_xxyy.y < 0.0f) {
+		float2 _right_top = invinterpolated_uv(focal_x, focal_y, principal_x, principal_y, dist_coeff, tan_xxyy.y, tan_xxyy.w);
+		float2 _right_bottom = invinterpolated_uv(focal_x, focal_y, principal_x, principal_y, dist_coeff, tan_xxyy.y, tan_xxyy.z);
+		float2 _left_mid = invinterpolated_uv(focal_x, focal_y, principal_x, principal_y, dist_coeff, tan_xxyy.x, 0.0f);
+		u = geer_interval(_left_mid.x, fmaxf(_right_bottom.x, _right_top.x));
+		v = geer_interval(_right_bottom.y, _right_top.y);
+	} else if ((tan_xxyy.z < 0.0f && tan_xxyy.w > 0.0f) && tan_xxyy.x > 0.0f) {
+		float2 _left_bottom = invinterpolated_uv(focal_x, focal_y, principal_x, principal_y, dist_coeff, tan_xxyy.x, tan_xxyy.z);
+		float2 _left_top = invinterpolated_uv(focal_x, focal_y, principal_x, principal_y, dist_coeff, tan_xxyy.x, tan_xxyy.w);
+		float2 _right_mid = invinterpolated_uv(focal_x, focal_y, principal_x, principal_y, dist_coeff, tan_xxyy.y, 0.0f);
+		u = geer_interval(fminf(_left_bottom.x, _left_top.x), _right_mid.x);
+		v = geer_interval(_left_bottom.y, _left_top.y);
+	} else {
+		float2 _mid_top = invinterpolated_uv(focal_x, focal_y, principal_x, principal_y, dist_coeff, 0.0f, tan_xxyy.w);
+		float2 _mid_bottom = invinterpolated_uv(focal_x, focal_y, principal_x, principal_y, dist_coeff, 0.0f, tan_xxyy.z);
+		float2 _left_mid = invinterpolated_uv(focal_x, focal_y, principal_x, principal_y, dist_coeff, tan_xxyy.x, 0.0f);
+		float2 _right_mid = invinterpolated_uv(focal_x, focal_y, principal_x, principal_y, dist_coeff, tan_xxyy.y, 0.0f);
+		u = geer_interval(_left_mid.x, _right_mid.x);
+		v = geer_interval(_mid_bottom.y, _mid_top.y);
+	}
+	// Half-open bounds with one-pixel padding, matching every consumer of the
+	// pixel AABB.  Flooring both edges used to drop the last column and row of
+	// every footprint and to delete sub-pixel Gaussians entirely.
+	return geer_store_pixel_aabb(W, H, u, v, u_indices, v_indices);
 }
 
 __forceinline__ __device__ bool opencv_pinhole_aabb(
@@ -749,7 +736,9 @@ __global__ void preprocess_gaussians_kernel(
     if (camera_model == CameraModelType::FISHEYE) {
         const float4* kb_params4 = reinterpret_cast<const float4*>(radial_coeffs);
         const float4 kb_params = kb_params4[0];
-        invinterpolated_aabb(W, H, Ks[0], Ks[4], Ks[2], Ks[5], kb_params, tan_xxyy, _aa, _bb);
+        if (!invinterpolated_aabb(
+			W, H, Ks[0], Ks[4], Ks[2], Ks[5], kb_params, tan_xxyy, _aa, _bb
+		)) return;
 
 	} else if (camera_model == CameraModelType::PINHOLE) {
 		if (radial_coeffs == nullptr && tangential_coeffs == nullptr &&
