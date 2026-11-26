@@ -31,6 +31,12 @@ class DefaultStrategy(Strategy):
     higher value, e.g., 0.0008. Also, the :func:`rasterization` function should be called
     with `absgrad=True` as well so that the absolute gradients are computed.
 
+    When `info["geer_gradient"]` is present, the strategy grows GSs by the 3DGEER
+    densification metric instead of the image plane gradients. The :func:`rasterization`
+    function only returns that tensor when it is called with
+    `with_geer_gradient=True`; without it the strategy falls back to
+    `key_for_gradient`.
+
     Args:
         prune_opa (float): GSs with opacity below this value will be pruned. Default is 0.005.
         grow_grad2d (float): GSs with image plane gradient above this value will be

@@ -134,6 +134,7 @@ def rasterization(
     covars: Optional[Tensor] = None,
     with_ut: bool = False,
     with_geer: bool = False,
+    with_geer_gradient: bool = False,
     with_eval3d: bool = False,
     # distortion
     radial_coeffs: Optional[Tensor] = None,  # [..., C, 6] or [..., C, 4]
@@ -289,8 +290,13 @@ def rasterization(
             `scales` will be ignored. [..., N, 3, 3], Default is None.
         with_ut: Whether to use Unscented Transform (UT) for projection. Default is False.
         with_geer: Whether to use 3DGEER for projection. Default is False.
-            When autograd is enabled, also returns the auxiliary densification
-            tensor in meta["geer_gradient"], whose gradient is populated by backward.
+        with_geer_gradient: Whether to also return the auxiliary densification
+            tensor in meta["geer_gradient"], whose gradient the backward pass
+            populates. It is the densification metric of the 3DGEER paper and
+            only `DefaultStrategy` reads it; every other consumer can leave it
+            off. Costs one [..., C, N, 3] tensor and three atomic adds per
+            Gaussian and pixel in the backward pass, so it defaults to False
+            and meta["geer_gradient"] is then None. Requires `with_geer=True`.
         with_eval3d: Whether to calculate Gaussian response in 3D world space, instead
             of 2D image space. Default is False.
         radial_coeffs: Opencv pinhole/fisheye radial distortion coefficients. Default is None.
@@ -385,6 +391,9 @@ def rasterization(
     assert render_mode in ["RGB", "D", "ED", "RGB+D", "RGB+ED"], render_mode
     assert not (with_ut and with_geer), "cannot render with ut and geer"
     assert not (with_geer and not with_eval3d), "cannot render geer without eval 3d"
+    assert not (
+        with_geer_gradient and not with_geer
+    ), "the geer gradient needs with_geer"
 
     if (rays_o is None) != (rays_d is None):
         raise ValueError("rays_o and rays_d must be given together")
@@ -529,7 +538,7 @@ def rasterization(
             thin_prism_coeffs=thin_prism_coeffs,
             ftheta_coeffs=ftheta_coeffs,
         )
-        if torch.is_grad_enabled():
+        if with_geer_gradient and torch.is_grad_enabled():
             geer_gradient = means.new_zeros(batch_dims + (C, N, 3), requires_grad=True)
 
     elif with_ut:
