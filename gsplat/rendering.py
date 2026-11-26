@@ -143,6 +143,9 @@ def rasterization(
     # rolling shutter
     rolling_shutter: RollingShutterType = RollingShutterType.GLOBAL,
     viewmats_rs: Optional[Tensor] = None,  # [..., C, 4, 4]
+    # external per pixel rays, 3DGEER only
+    rays_o: Optional[Tensor] = None,  # [..., C, H, W, 3]
+    rays_d: Optional[Tensor] = None,  # [..., C, H, W, 3]
 ) -> Tuple[Tensor, Tensor, Dict]:
     """Rasterize a set of 3D Gaussians (N) to a batch of image planes (C).
 
@@ -302,6 +305,22 @@ def rasterization(
         rolling_shutter: The rolling shutter type. Default `RollingShutterType.GLOBAL` means
             global shutter.
         viewmats_rs: The second viewmat when rolling shutter is used. Default is None.
+        rays_o: Optional per pixel world space ray origins, [..., C, H, W, 3]. Only
+            supported together with `with_geer=True`. Default is None.
+        rays_d: Optional per pixel world space ray directions, [..., C, H, W, 3],
+            given together with `rays_o`. Default is None.
+
+            When the rays are given, the rasterizer uses them instead of building
+            one ray per pixel from the camera model, and gradients flow back to
+            them. That puts the whole camera model into PyTorch, so focal length,
+            distortion and pose are trained through the rays. Note that `Ks`,
+            `camera_model` and the distortion coefficients are still required and
+            still used, but only for the tile assignment and the frustum cull, and
+            no gradient flows through them. The external rays therefore have to
+            agree with that camera model to roughly a pixel, otherwise a Gaussian
+            can be culled at a pixel whose external ray still sees it. Pass unit
+            length directions, since the returned gradients are with respect to the
+            vectors as given.
 
     Returns:
         A tuple:
@@ -366,6 +385,26 @@ def rasterization(
     assert render_mode in ["RGB", "D", "ED", "RGB+D", "RGB+ED"], render_mode
     assert not (with_ut and with_geer), "cannot render with ut and geer"
     assert not (with_geer and not with_eval3d), "cannot render geer without eval 3d"
+
+    if (rays_o is None) != (rays_d is None):
+        raise ValueError("rays_o and rays_d must be given together")
+    if rays_o is not None:
+        if not with_geer:
+            raise ValueError("external rays are only supported with `with_geer=True`")
+        ray_shape = batch_dims + (C, height, width, 3)
+        for name, rays in (("rays_o", rays_o), ("rays_d", rays_d)):
+            if rays.shape != ray_shape:
+                raise ValueError(
+                    f"{name} must have shape {tuple(ray_shape)}, got "
+                    f"{tuple(rays.shape)}"
+                )
+            if rays.dtype != torch.float32:
+                raise ValueError(f"{name} must be float32, got {rays.dtype}")
+            if rays.device != means.device:
+                raise ValueError(
+                    f"{name} must live on the same device as the means "
+                    f"({means.device}), got {rays.device}"
+                )
 
     def reshape_view(C: int, world_view: torch.Tensor, N_world: list) -> torch.Tensor:
         view_list = list(
@@ -838,6 +877,8 @@ def rasterization(
                     viewmats_rs=viewmats_rs,
                     pbf_bounds=pbf_bounds if with_geer else None,
                     geer_gradient=geer_gradient,
+                    rays_o=rays_o,
+                    rays_d=rays_d,
                 )
             else:
                 render_colors_, render_alphas_ = rasterize_to_pixels(
@@ -883,6 +924,8 @@ def rasterization(
                 viewmats_rs=viewmats_rs,
                 pbf_bounds=pbf_bounds if with_geer else None,
                 geer_gradient=geer_gradient,
+                rays_o=rays_o,
+                rays_d=rays_d,
             )
         else:
             render_colors, render_alphas = rasterize_to_pixels(

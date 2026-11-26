@@ -572,7 +572,12 @@ rasterize_to_pixels_from_world_3dgs_fwd(
     // intersections
     const at::Tensor tile_offsets, // [..., C, tile_height, tile_width]
     const at::Tensor flatten_ids,  // [n_isects]
-    const at::optional<at::Tensor> pbf_bounds // [..., C, N, 4], optional
+    const at::optional<at::Tensor> pbf_bounds, // [..., C, N, 4], optional
+    // external rays. When given they replace the rays that the camera model
+    // would build per pixel. The camera model is still used for the tile
+    // assignment outside of this op.
+    const at::optional<at::Tensor> rays_os, // [..., C, H, W, 3], optional
+    const at::optional<at::Tensor> rays_ds  // [..., C, H, W, 3], optional
 );
 
 std::tuple<
@@ -613,6 +618,11 @@ rasterize_to_pixels_from_world_3dgs_bwd(
     const at::Tensor tile_offsets,    // [..., C, tile_height, tile_width]
     const at::Tensor flatten_ids,     // [n_isects]
     const at::optional<at::Tensor> pbf_bounds, // [..., C, N, 4], optional
+    // external rays. When given they replace the rays that the camera model
+    // would build per pixel. The camera model is still used for the tile
+    // assignment outside of this op.
+    const at::optional<at::Tensor> rays_os, // [..., C, H, W, 3], optional
+    const at::optional<at::Tensor> rays_ds, // [..., C, H, W, 3], optional
     // forward outputs
     const at::Tensor render_alphas,   // [..., C, image_height, image_width, 1]
     const at::Tensor last_ids,        // [..., C, image_height, image_width]

@@ -761,6 +761,15 @@ inline __device__ vec3 safe_normalize(vec3 v) {
     return l > 0.0f ? (v * rsqrtf(l)) : v;
 }
 
+// A ray supplied from outside replaces the one the camera model would build.
+// It is usable as long as it is finite and has a direction, which mirrors the
+// `valid_flag` of the camera models.
+inline __device__ bool world_ray_is_valid(const vec3 &ray_o, const vec3 &ray_d) {
+    return isfinite(ray_o.x) && isfinite(ray_o.y) && isfinite(ray_o.z) &&
+           isfinite(ray_d.x) && isfinite(ray_d.y) && isfinite(ray_d.z) &&
+           glm::dot(ray_d, ray_d) > 0.0f;
+}
+
 inline __device__ vec3 safe_normalize_bw(const vec3 &v, const vec3 &d_out) {
     const float l = v.x * v.x + v.y * v.y + v.z * v.z;
     if (l > 0.0f) {
