@@ -312,6 +312,11 @@ __global__ void rasterize_to_pixels_from_world_3dgs_bwd_kernel(
             mat3 Mt;
             vec3 o_minus_mu, gro, grd, grd_n, gcrod;
             float grayDist, power;
+            // Set when the peak response of the half line t >= 0 sits at its
+            // origin, see the forward kernel.  The branch is decided from the
+            // very same intermediates the forward pass uses, so the two passes
+            // never disagree about which side of the seam a pixel is on.
+            bool clamped = false;
             if (valid) {
                 const vec4 xyz_opac = xyz_opacity_batch[t];
                 opac = xyz_opac[3];
@@ -336,8 +341,15 @@ __global__ void rasterize_to_pixels_from_world_3dgs_bwd_kernel(
                 gro = Mt * o_minus_mu;
                 grd = Mt * ray_d;
                 grd_n = safe_normalize(grd);
-                gcrod = glm::cross(grd_n, gro);
-                grayDist = glm::dot(gcrod, gcrod);
+                const float tstar = -glm::dot(gro, grd_n);
+                clamped = tstar <= 0.f;
+                if (clamped) {
+                    gcrod = {0.f, 0.f, 0.f};
+                    grayDist = glm::dot(gro, gro);
+                } else {
+                    gcrod = glm::cross(grd_n, gro);
+                    grayDist = glm::dot(gcrod, gcrod);
+                }
                 power = -0.5f * grayDist;
 
                 vis = __expf(power);
@@ -390,12 +402,22 @@ __global__ void rasterize_to_pixels_from_world_3dgs_bwd_kernel(
                 if (opac * vis <= 0.99f) {
                     const float v_vis = opac * v_alpha;
                     float v_gradDist = -0.5f * vis * v_vis;
-                    vec3 v_gcrod = 2.0f * v_gradDist * gcrod;
-                    vec3 v_grd_n = - glm::cross(v_gcrod, gro);
-                    vec3 v_gro = glm::cross(v_gcrod, grd_n);
-                    vec3 v_grd = safe_normalize_bw(grd, v_grd_n);
-                    mat3 v_Mt = glm::outerProduct(v_grd, ray_d) + 
-                        glm::outerProduct(v_gro, o_minus_mu);
+                    vec3 v_gro;
+                    vec3 v_grd = {0.f, 0.f, 0.f};
+                    mat3 v_Mt;
+                    if (clamped) {
+                        // grayDist = dot(gro, gro) does not involve the
+                        // direction at all, so the direction picks up nothing.
+                        v_gro = 2.0f * v_gradDist * gro;
+                        v_Mt = glm::outerProduct(v_gro, o_minus_mu);
+                    } else {
+                        vec3 v_gcrod = 2.0f * v_gradDist * gcrod;
+                        vec3 v_grd_n = - glm::cross(v_gcrod, gro);
+                        v_gro = glm::cross(v_gcrod, grd_n);
+                        v_grd = safe_normalize_bw(grd, v_grd_n);
+                        v_Mt = glm::outerProduct(v_grd, ray_d) +
+                            glm::outerProduct(v_gro, o_minus_mu);
+                    }
                     vec3 v_o_minus_mu = glm::transpose(Mt) * v_gro;
 
                     if (v_geer_gradient != nullptr) {
@@ -411,7 +433,9 @@ __global__ void rasterize_to_pixels_from_world_3dgs_bwd_kernel(
                     if (compute_ray_grads) {
                         // gro = Mt * (ray_o - mean), grd = Mt * ray_d
                         v_ray_o_pix += v_o_minus_mu;
-                        v_ray_d_pix += glm::transpose(Mt) * v_grd;
+                        if (!clamped) {
+                            v_ray_d_pix += glm::transpose(Mt) * v_grd;
+                        }
                     }
 
                     v_mean_local += -v_o_minus_mu;
