@@ -312,7 +312,11 @@ def rasterization(
             bounds their pixel footprint from the 3 sigma ball and uses the
             stock tile assignment. It renders the full image circle of a
             fisheye, at the price of a looser bound. Only "pinhole" and
-            "fisheye" are supported, and the semantics change in four places:
+            "fisheye" are supported, and only the fisheye branch reaches past
+            90 degrees: the pinhole branch still culls every Gaussian centre at
+            or behind the camera plane, so one whose tail reaches across that
+            plane is dropped there as well. The semantics change in four
+            places:
             `meta["depths"]` and the "D" and "ED" render modes carry the
             euclidean distance to the camera centre rather than the camera
             frame z, `near_plane` and `far_plane` cut on that distance,

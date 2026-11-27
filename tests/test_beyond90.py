@@ -742,6 +742,101 @@ def test_the_two_tile_modes_agree_below_90_degrees(camera_model):
     assert alpha_error < 1e-2
 
 
+def test_the_slope_bound_really_bounds_the_slope():
+    """The Kannala Brandt derivative never exceeds the bound used for radii.
+
+    `dr/dtheta` is a degree eight polynomial whose coefficients are a fit, not
+    a lens, so it is neither monotonic nor single signed and sampling it at the
+    ends and the middle of an interval is not a bound. Replacing every
+    coefficient by its magnitude is. The sampled maximum is computed alongside
+    to show how far short it can fall.
+    """
+    from gsplat.geer._preprocess import _fisheye_slope_bound
+
+    generator = torch.Generator(device="cpu").manual_seed(17)
+    coeffs = (torch.rand(512, 4, generator=generator) - 0.5) * 2.0
+    coeffs = coeffs.to(device)
+    theta_max = (
+        0.05 + math.pi * torch.rand(512, 1, generator=generator).to(device)
+    )
+
+    grid = torch.linspace(0.0, 1.0, 2001, device=device)[None, :] * theta_max
+    powers = torch.stack([grid ** (2 * index + 2) for index in range(4)], dim=-1)
+    factors = torch.tensor([3.0, 5.0, 7.0, 9.0], device=device)
+    slope = 1.0 + (powers * (coeffs * factors)[:, None, :]).sum(-1)
+    true_max = slope.abs().amax(dim=1)
+
+    # The bound takes `[..., C, 4]` coefficients against `[..., C, N]` angles,
+    # so each random draw plays the part of one camera with a single Gaussian.
+    bound = _fisheye_slope_bound(theta_max, coeffs)[:, 0]
+
+    # What sampling the two ends and the middle would have claimed.
+    sampled = torch.stack(
+        [
+            slope[:, 0].abs(),
+            slope[:, slope.shape[1] // 2].abs(),
+            slope[:, -1].abs(),
+        ],
+        dim=-1,
+    ).amax(dim=-1)
+
+    worst_sampled = float((true_max / sampled.clamp_min(1e-12)).max())
+    headroom = float((bound / true_max.clamp_min(1e-12)).min())
+    print(
+        f"three point sampling underestimates by up to {worst_sampled:.1f}x; "
+        f"the bound keeps a factor of at least {headroom:.3f}"
+    )
+    assert worst_sampled > 2.0, "the regime under test is not being hit"
+    assert bool((bound >= true_max - 1e-4 * bound).all())
+
+    # And for the equidistant model it is exactly the constant 1.
+    zeros = torch.zeros(1, 4, device=device)
+    exact = _fisheye_slope_bound(torch.full((1, 1), 3.0, device=device), zeros)
+    assert float(exact) == 1.0
+
+
+def test_depth_gradient_flows_in_projection_mode():
+    """"D" renders keep their gradient, the tile assignment stays detached.
+
+    The depth the projection path draws is the euclidean distance, built with
+    the graph attached. Detaching it would silently cut the gradient that
+    reaches `means` through the depth value, which this difference catches.
+    """
+    scene_tensors = list(smooth_scene())
+    means = scene_tensors[0].clone().requires_grad_(True)
+    scene_tensors[0] = means
+    rays_o, rays_d = equidistant_rays(GRAD_FOCAL, W, H)
+    grad_output = cotangent(H, W, channels=1, seed=13)
+
+    def loss():
+        depth, _, _ = render(
+            tuple(scene_tensors),
+            "projection",
+            focal=GRAD_FOCAL,
+            width=W,
+            height=H,
+            rays_o=rays_o,
+            rays_d=rays_d,
+            render_mode="D",
+        )
+        return (depth[0] * grad_output).sum()
+
+    (analytic,) = torch.autograd.grad(loss(), means)
+    worst = 0.0
+    flat = means.reshape(-1)
+    for position in (0, 2, 4, 8):
+        numeric = central_difference(loss, flat[position], 2e-3)
+        expected = float(analytic.reshape(-1)[position])
+        error = abs(expected - numeric) / max(abs(numeric), 1e-3)
+        worst = max(worst, error)
+        print(
+            f"depth d(loss)/d(means[{position}]): autograd {expected:+.6f}, "
+            f"central difference {numeric:+.6f}, relative error {error:.4%}"
+        )
+    assert float(analytic.abs().max()) > 1e-3, "the depth gradient is zero"
+    assert worst < 2e-2
+
+
 def test_projection_mode_reports_euclidean_depth():
     """`meta["depths"]` and the "D" render mode carry distances, not z."""
     scene_tensors = one_gaussian(40.0, distance=3.0, scale=0.2)

@@ -149,28 +149,45 @@ _AXIS_EPS = 1e-9
 _PINHOLE_MAX_THETA = 0.5 * math.pi - 1e-3
 
 
-def _fisheye_radius_and_slope(
-    theta: Tensor, radial_coeffs: Optional[Tensor]
-) -> Tuple[Tensor, Tensor]:
-    """Kannala Brandt radius and its slope, in normalised image units.
+def _fisheye_radius(theta: Tensor, radial_coeffs: Optional[Tensor]) -> Tensor:
+    """Kannala Brandt image radius, in normalised image units.
 
-    `r(theta) = theta + k1 theta^3 + k2 theta^5 + k3 theta^7 + k4 theta^9` and
-    `dr/dtheta = 1 + 3 k1 theta^2 + 5 k2 theta^4 + 7 k3 theta^6 + 9 k4 theta^8`,
-    the very polynomials `OpenCVFisheyeCameraModel` builds. `theta` is
-    `[..., C, N]`, or a stack of such tensors, and `radial_coeffs` is
-    `[..., C, 4]`.
+    `r(theta) = theta + k1 theta^3 + k2 theta^5 + k3 theta^7 + k4 theta^9`, the
+    very polynomial `OpenCVFisheyeCameraModel` builds. `theta` is `[..., C, N]`
+    and `radial_coeffs` is `[..., C, 4]`.
     """
-    theta2 = theta * theta
-    radius = torch.ones_like(theta)
-    slope = torch.ones_like(theta)
+    series = torch.ones_like(theta)
     if radial_coeffs is not None:
+        theta2 = theta * theta
         power = theta2
         for index in range(4):
-            coeff = radial_coeffs[..., index][..., None]
-            radius = radius + coeff * power
-            slope = slope + (2 * index + 3) * coeff * power
+            series = series + radial_coeffs[..., index][..., None] * power
             power = power * theta2
-    return radius * theta, slope
+    return series * theta
+
+
+def _fisheye_slope_bound(
+    theta_max: Tensor, radial_coeffs: Optional[Tensor]
+) -> Tensor:
+    """Upper bound of `|dr/dtheta|` over `[0, theta_max]`.
+
+    The derivative is `1 + 3 k1 theta^2 + 5 k2 theta^4 + 7 k3 theta^6 +
+    9 k4 theta^8`, which is neither monotonic nor single signed once the
+    coefficients are a fit rather than a lens, so sampling it at a few angles
+    is not a bound. Replacing every coefficient by its magnitude makes each
+    term non negative and increasing in `theta`, so evaluating that at the far
+    end of the interval dominates `|dr/dtheta|` everywhere on it. For the
+    equidistant model, where all coefficients vanish, this is exactly 1.
+    """
+    bound = torch.ones_like(theta_max)
+    if radial_coeffs is not None:
+        theta2 = theta_max * theta_max
+        power = theta2
+        for index in range(4):
+            coeff = radial_coeffs[..., index][..., None].abs()
+            bound = bound + (2 * index + 3) * coeff * power
+            power = power * theta2
+    return bound
 
 
 def _project_centres(
@@ -197,6 +214,12 @@ def _project_centres(
     radial spread of `ang * max|dr/dtheta|` and an azimuthal spread of at most
     `asin(sin(ang) / sin(theta))`. Together they bound the distance from the
     projected centre to any point of the footprint.
+
+    The pinhole branch keeps the behaviour of `_prepare_geer` and culls every
+    centre at or behind the camera plane, so a Gaussian whose 3 sigma ball
+    reaches across that plane while its centre sits behind it is dropped even
+    though its tail would still be visible. Only the fisheye branch is meant
+    to work past 90 degrees.
     """
     # A disk at the image centre with half the diagonal as its radius covers
     # the whole image; one full diagonal covers it from anywhere nearby and
@@ -226,31 +249,19 @@ def _project_centres(
 
     if camera_model == "fisheye":
         theta = torch.atan2(rho, z)
-        # The polynomial is not monotonic in general, so sample its slope at
-        # both ends of the interval and in the middle. One stacked evaluation
-        # instead of three keeps the kernel launches down.
-        samples = torch.stack(
-            (
-                theta,
-                (theta - ang).clamp_min(0.0),
-                (theta + ang).clamp_max(math.pi),
-            ),
-            dim=0,
+        radius_norm = _fisheye_radius(theta, radial_coeffs)
+        max_slope = _fisheye_slope_bound(
+            (theta + ang).clamp_max(math.pi), radial_coeffs
         )
-        radius_samples, slope_samples = _fisheye_radius_and_slope(
-            samples, radial_coeffs
-        )
-        radius_norm = radius_samples[0]
-        max_slope = slope_samples.abs().amax(dim=0)
         # A centre exactly behind the camera has no azimuth, so its projection
         # is undefined. The ring it would draw is left out on purpose.
         valid = ~(on_axis & (z < 0.0))
     else:
         theta = torch.atan2(rho, z.clamp_min(torch.finfo(points.dtype).tiny))
         theta = theta.clamp(max=_PINHOLE_MAX_THETA)
-        theta_lo = (theta - ang).clamp_min(0.0)
         theta_hi = (theta + ang).clamp(max=_PINHOLE_MAX_THETA)
         radius_norm = torch.tan(theta)
+        # 1 / cos^2 grows with theta, so the far end of the interval bounds it.
         max_slope = 1.0 / torch.cos(theta_hi).square()
         valid = z > 0.0
 
@@ -346,7 +357,9 @@ def _prepare_geer_projection(
 
     * `depths` is the euclidean distance to the camera centre, not the camera
       frame z. Beyond 90 degrees z is negative and useless both as a sort key
-      and as a depth value, so "D" and "ED" renders carry distances here.
+      and as a depth value, so "D" and "ED" renders carry distances here. It
+      is differentiable in `means` and `viewmats` like the camera frame z of
+      `_prepare_geer`; only the tile assignment runs detached.
     * `near_plane` and `far_plane` cut on that distance as well.
     * The per Gaussian pixel bounds (`pbf_bounds`) are gone, so a tile tests
       every Gaussian that reaches it. Tiles are the only culling left.
@@ -359,13 +372,15 @@ def _prepare_geer_projection(
     table. That table is dead output, nothing reads it, but fixing it belongs
     to the shared tile assignment and not here.
 
-    Known limits: only `pinhole` and `fisheye` are supported, a Gaussian whose
-    centre sits exactly on the optical axis behind the camera is dropped, and
-    the footprint of a Gaussian very close to 180 degrees is a ring that the
-    disk around its projected centre only bounds up to the image diagonal cap.
-    A Kannala Brandt fit (a UCM handed over as a fisheye, say) is only valid up
-    to the angle it was fitted on; beyond that the polynomial diverges and the
-    radius runs into the image diagonal cap.
+    Known limits: only `pinhole` and `fisheye` are supported, and only the
+    fisheye branch works past 90 degrees, since the pinhole branch still culls
+    every centre at or behind the camera plane. A Gaussian whose centre sits
+    exactly on the optical axis behind the camera is dropped. The footprint of
+    a Gaussian very close to 180 degrees is a ring that the disk around its
+    projected centre only bounds up to the image diagonal cap. A Kannala
+    Brandt fit (a UCM handed over as a fisheye, say) is only valid up to the
+    angle it was fitted on; beyond that the polynomial diverges and the radius
+    runs into the image diagonal cap.
     """
     if camera_model not in ("pinhole", "fisheye"):
         raise ValueError(
@@ -395,19 +410,24 @@ def _prepare_geer_projection(
 
     scales, _, compensations = _antialias(scales, opacities, rasterize_mode)
 
+    # The distance doubles as the depth that the "D" and "ED" render modes
+    # draw, so it is built with the graph attached, exactly as `_prepare_geer`
+    # builds its camera frame z. Everything the tile assignment needs is taken
+    # from the detached copies below.
+    rotation = viewmats[..., :3, :3].transpose(-1, -2)  # [..., C, 3, 3]
+    translation = viewmats[..., :3, 3][..., None, :]  # [..., C, 1, 3]
+    points = means[..., None, :, :] @ rotation + translation  # [..., C, N, 3]
+    depths = points.norm(dim=-1)  # [..., C, N]
+
     with torch.no_grad():
-        rotation = viewmats[..., :3, :3].transpose(-1, -2)  # [..., C, 3, 3]
-        translation = viewmats[..., :3, 3][..., None, :]  # [..., C, 1, 3]
-        points = (
-            means[..., None, :, :].detach() @ rotation + translation
-        )  # [..., C, N, 3]
-        distance = points.norm(dim=-1)  # [..., C, N]
+        points_detached = points.detach()
+        distance = depths.detach()
 
         max_scales = scales.detach().amax(dim=-1)[..., None, :]  # [..., 1, N]
         max_scales = max_scales.expand(batch_dims + (C, N))
 
         means2d, radius, valid = _project_centres(
-            points,
+            points_detached,
             distance,
             Ks,
             camera_model,
@@ -428,14 +448,16 @@ def _prepare_geer_projection(
         ).to(torch.int32)
         radii = torch.stack((radii_1d, radii_1d), dim=-1)  # [..., C, N, 2]
         means2d = torch.where(valid[..., None], means2d, torch.zeros_like(means2d))
-        depths = torch.where(
+        # A culled Gaussian reaches no tile, but a non finite sort key would
+        # still scramble the order of the ones that do.
+        sort_keys = torch.where(
             torch.isfinite(distance), distance, torch.zeros_like(distance)
         )
 
         tiles_per_gauss, isect_ids, flatten_ids = isect_tiles(
             means2d.contiguous(),
             radii.contiguous(),
-            depths.contiguous(),
+            sort_keys.contiguous(),
             tile_size,
             tile_width,
             tile_height,
