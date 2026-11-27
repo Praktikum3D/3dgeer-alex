@@ -26,7 +26,7 @@ from .distributed import (
     all_to_all_int32,
     all_to_all_tensor_list,
 )
-from .geer._preprocess import _prepare_geer
+from .geer._preprocess import _prepare_geer, _prepare_geer_projection
 from .utils import depth_to_normal, get_projection_matrix
 
 
@@ -135,6 +135,7 @@ def rasterization(
     with_ut: bool = False,
     with_geer: bool = False,
     with_geer_gradient: bool = False,
+    geer_tile_mode: Literal["pbf", "projection"] = "pbf",
     with_eval3d: bool = False,
     # distortion
     radial_coeffs: Optional[Tensor] = None,  # [..., C, 6] or [..., C, 4]
@@ -297,6 +298,29 @@ def rasterization(
             off. Costs one [..., C, N, 3] tensor and three atomic adds per
             Gaussian and pixel in the backward pass, so it defaults to False
             and meta["geer_gradient"] is then None. Requires `with_geer=True`.
+        geer_tile_mode: How 3DGEER assigns Gaussians to tiles. Requires
+            `with_geer=True`. Default is "pbf".
+
+            "pbf" builds the perspective bounding frustum of the 3DGEER paper in
+            tangent space. It is tight and gives every Gaussian exact pixel
+            bounds, but it needs the Gaussian centre in front of the camera
+            plane and a finite tangent of the field of view, so it renders
+            nothing beyond about 90 degrees off axis.
+
+            "projection" instead projects the Gaussian centres with the camera
+            model itself, where `atan2(rho, z)` keeps working past 90 degrees,
+            bounds their pixel footprint from the 3 sigma ball and uses the
+            stock tile assignment. It renders the full image circle of a
+            fisheye, at the price of a looser bound. Only "pinhole" and
+            "fisheye" are supported, and the semantics change in four places:
+            `meta["depths"]` and the "D" and "ED" render modes carry the
+            euclidean distance to the camera centre rather than the camera
+            frame z, `near_plane` and `far_plane` cut on that distance,
+            `meta["pbf_bounds"]` is None because there are no per Gaussian
+            pixel bounds any more, and the front to back order follows the
+            distance rather than z, which can reorder overlapping Gaussians
+            against the "pbf" path. Like the "pbf" path it renders one image
+            per call.
         with_eval3d: Whether to calculate Gaussian response in 3D world space, instead
             of 2D image space. Default is False.
         radial_coeffs: Opencv pinhole/fisheye radial distortion coefficients. Default is None.
@@ -394,6 +418,12 @@ def rasterization(
     assert not (
         with_geer_gradient and not with_geer
     ), "the geer gradient needs with_geer"
+    if geer_tile_mode not in ("pbf", "projection"):
+        raise ValueError(
+            f"geer_tile_mode must be 'pbf' or 'projection', got '{geer_tile_mode}'"
+        )
+    if geer_tile_mode == "projection" and not with_geer:
+        raise ValueError("geer_tile_mode='projection' needs `with_geer=True`")
 
     if (rays_o is None) != (rays_d is None):
         raise ValueError("rays_o and rays_d must be given together")
@@ -515,7 +545,10 @@ def rasterization(
 
     if with_geer: # geer does not compute 2d projection
         assert scales is not None
-        proj_results, geer_intersections, scales = _prepare_geer(
+        prepare = (
+            _prepare_geer if geer_tile_mode == "pbf" else _prepare_geer_projection
+        )
+        proj_results, geer_intersections, scales = prepare(
             means=means,
             quats=quats,
             scales=scales,

@@ -283,8 +283,20 @@ __global__ void rasterize_to_pixels_from_world_3dgs_fwd_kernel(
 
             const vec3 gro = iscl_rot * (ray_o - xyz);
             const vec3 grd = safe_normalize(iscl_rot * ray_d);
-            const vec3 gcrod = glm::cross(grd, gro);
-            const float grayDist = glm::dot(gcrod, gcrod);
+            // Peak response along the HALF line t >= 0 rather than along the
+            // infinite line through the ray.  The closest point of the
+            // infinite line sits at t* = -dot(gro, grd); when it lies behind
+            // the ray origin the strongest response the ray can reach is the
+            // one at its origin.  Both expressions agree at t* = 0, and so do
+            // their derivatives, so the clamp is smooth.
+            const float tstar = -glm::dot(gro, grd);
+            float grayDist;
+            if (tstar <= 0.f) {
+                grayDist = glm::dot(gro, gro);
+            } else {
+                const vec3 gcrod = glm::cross(grd, gro);
+                grayDist = glm::dot(gcrod, gcrod);
+            }
             const float power = -0.5f * grayDist;
 
             float alpha = min(0.99f, opac * __expf(power));
